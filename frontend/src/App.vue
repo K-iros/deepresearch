@@ -386,6 +386,11 @@ const error = ref("");
 const progressLogs = ref<string[]>([]);
 const logsCollapsed = ref(false);
 const isExpanded = ref(false);
+const runId = ref("");
+const traceId = ref("");
+const lastSequence = ref(0);
+const seenSequences = ref<Set<number>>(new Set());
+const MAX_RESUME_ATTEMPTS = 2;
 
 const todoTasks = ref<TodoTaskView[]>([]);
 const activeTaskId = ref<number | null>(null);
@@ -641,6 +646,10 @@ function resetWorkflowState() {
   reportHighlight.value = false;
   toolHighlight.value = false;
   logsCollapsed.value = false;
+  runId.value = "";
+  traceId.value = "";
+  lastSequence.value = 0;
+  seenSequences.value = new Set();
 }
 
 function findTask(taskId: unknown): TodoTaskView | undefined {
@@ -668,6 +677,23 @@ function upsertTaskMetadata(task: TodoTaskView, payload: Record<string, unknown>
   }
 }
 
+function resolveEventType(event: ResearchStreamEvent): string {
+  const raw = event as Record<string, unknown>;
+  if (typeof raw.event_type === "string" && raw.event_type.trim()) {
+    return raw.event_type.trim();
+  }
+  if (typeof raw.type === "string" && raw.type.trim()) {
+    return raw.type.trim();
+  }
+  return "";
+}
+
+function mergeEventPayload(event: ResearchStreamEvent): Record<string, unknown> {
+  const raw = event as Record<string, unknown>;
+  const payload = ensureRecord(raw.payload);
+  return { ...payload, ...raw };
+}
+
 const handleSubmit = async () => {
   if (!form.topic.trim()) {
     error.value = "请输入研究主题";
@@ -692,254 +718,296 @@ const handleSubmit = async () => {
     search_api: form.searchApi || undefined
   };
 
+  runId.value =
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random()}`;
+  traceId.value = runId.value;
+
+  const onEvent = (event: ResearchStreamEvent) => {
+    const mergedEvent = mergeEventPayload(event);
+    const eventType = resolveEventType(event);
+
+    const sequence =
+      typeof mergedEvent.sequence === "number" ? mergedEvent.sequence : null;
+    if (sequence !== null) {
+      if (seenSequences.value.has(sequence)) {
+        return;
+      }
+      seenSequences.value.add(sequence);
+      if (sequence > lastSequence.value) {
+        lastSequence.value = sequence;
+      }
+    }
+
+    if (typeof mergedEvent.run_id === "string" && mergedEvent.run_id.trim()) {
+      runId.value = mergedEvent.run_id.trim();
+    }
+    if (typeof mergedEvent.trace_id === "string" && mergedEvent.trace_id.trim()) {
+      traceId.value = mergedEvent.trace_id.trim();
+    }
+
+    if (eventType === "status") {
+      const message =
+        typeof mergedEvent.message === "string" && mergedEvent.message.trim()
+          ? mergedEvent.message
+          : "流程状态更新";
+      progressLogs.value.push(message);
+
+      const task = findTask(mergedEvent.task_id);
+      if (task && message) {
+        task.notices.push(message);
+        applyNoteMetadata(task, mergedEvent);
+      }
+      return;
+    }
+
+    if (eventType === "todo_list") {
+      const tasks = Array.isArray(mergedEvent.tasks)
+        ? (mergedEvent.tasks as Record<string, unknown>[])
+        : [];
+
+      todoTasks.value = tasks.map((item, index) => {
+        const rawId =
+          typeof item.id === "number"
+            ? item.id
+            : typeof item.id === "string"
+            ? Number(item.id)
+            : index + 1;
+        const id = Number.isFinite(rawId) ? Number(rawId) : index + 1;
+        const noteId =
+          typeof item.note_id === "string" && item.note_id.trim()
+            ? item.note_id.trim()
+            : null;
+        const notePath =
+          typeof item.note_path === "string" && item.note_path.trim()
+            ? item.note_path.trim()
+            : null;
+
+        return {
+          id,
+          title:
+            typeof item.title === "string" && item.title.trim()
+              ? item.title.trim()
+              : `任务${id}`,
+          intent:
+            typeof item.intent === "string" && item.intent.trim()
+              ? item.intent.trim()
+              : "探索与主题相关的关键信息",
+          query:
+            typeof item.query === "string" && item.query.trim()
+              ? item.query.trim()
+              : form.topic.trim(),
+          status:
+            typeof item.status === "string" && item.status.trim()
+              ? item.status.trim()
+              : "pending",
+          summary: "",
+          sourcesSummary: "",
+          sourceItems: [],
+          notices: [],
+          noteId,
+          notePath,
+          toolCalls: []
+        } as TodoTaskView;
+      });
+
+      if (todoTasks.value.length) {
+        activeTaskId.value = todoTasks.value[0].id;
+        progressLogs.value.push("已生成任务清单");
+      } else {
+        progressLogs.value.push("未生成任务清单，使用默认任务继续");
+      }
+      return;
+    }
+
+    if (eventType === "task_status") {
+      const task = findTask(mergedEvent.task_id);
+      if (!task) {
+        return;
+      }
+
+      upsertTaskMetadata(task, mergedEvent);
+      applyNoteMetadata(task, mergedEvent);
+      const status =
+        typeof mergedEvent.status === "string" && mergedEvent.status.trim()
+          ? mergedEvent.status.trim()
+          : task.status;
+      task.status = status;
+
+      if (status === "in_progress") {
+        task.summary = "";
+        task.sourcesSummary = "";
+        task.sourceItems = [];
+        task.notices = [];
+        activeTaskId.value = task.id;
+        progressLogs.value.push(`开始执行任务：${task.title}`);
+      } else if (status === "completed") {
+        if (typeof mergedEvent.summary === "string" && mergedEvent.summary.trim()) {
+          task.summary = mergedEvent.summary.trim();
+        }
+        if (
+          typeof mergedEvent.sources_summary === "string" &&
+          mergedEvent.sources_summary.trim()
+        ) {
+          task.sourcesSummary = mergedEvent.sources_summary.trim();
+          task.sourceItems = parseSources(task.sourcesSummary);
+        }
+        progressLogs.value.push(`完成任务：${task.title}`);
+        if (activeTaskId.value === task.id) {
+          pulse(summaryHighlight);
+          pulse(sourcesHighlight);
+        }
+      } else if (status === "skipped") {
+        progressLogs.value.push(`任务跳过：${task.title}`);
+      }
+      return;
+    }
+
+    if (eventType === "sources") {
+      const task = findTask(mergedEvent.task_id);
+      if (!task) {
+        return;
+      }
+
+      const textCandidates = [
+        mergedEvent.latest_sources,
+        mergedEvent.sources_summary,
+        mergedEvent.raw_context
+      ];
+      const latestText = textCandidates
+        .map((value) => (typeof value === "string" ? value.trim() : ""))
+        .find((value) => value);
+
+      if (latestText) {
+        task.sourcesSummary = latestText;
+        task.sourceItems = parseSources(latestText);
+        if (activeTaskId.value === task.id) {
+          pulse(sourcesHighlight);
+        }
+        progressLogs.value.push(`已更新任务来源：${task.title}`);
+      }
+
+      if (typeof mergedEvent.backend === "string") {
+        progressLogs.value.push(`当前使用搜索后端：${mergedEvent.backend}`);
+      }
+
+      applyNoteMetadata(task, mergedEvent);
+      return;
+    }
+
+    if (eventType === "task_summary_chunk") {
+      const task = findTask(mergedEvent.task_id);
+      if (!task) {
+        return;
+      }
+      const chunk = typeof mergedEvent.content === "string" ? mergedEvent.content : "";
+      task.summary += chunk;
+      applyNoteMetadata(task, mergedEvent);
+      if (activeTaskId.value === task.id) {
+        pulse(summaryHighlight);
+      }
+      return;
+    }
+
+    if (eventType === "tool_call") {
+      const eventId =
+        typeof mergedEvent.event_id === "number"
+          ? mergedEvent.event_id
+          : Date.now();
+      const agent =
+        typeof mergedEvent.agent === "string" && mergedEvent.agent.trim()
+          ? mergedEvent.agent.trim()
+          : "Agent";
+      const tool =
+        typeof mergedEvent.tool === "string" && mergedEvent.tool.trim()
+          ? mergedEvent.tool.trim()
+          : "tool";
+      const parameters = ensureRecord(mergedEvent.parameters);
+      const result = typeof mergedEvent.result === "string" ? mergedEvent.result : "";
+      const noteId = extractOptionalString(mergedEvent.note_id);
+      const notePath = extractOptionalString(mergedEvent.note_path);
+
+      const task = findTask(mergedEvent.task_id);
+      if (task) {
+        task.toolCalls.push({
+          eventId,
+          agent,
+          tool,
+          parameters,
+          result,
+          noteId,
+          notePath,
+          timestamp: Date.now()
+        });
+        if (noteId) {
+          task.noteId = noteId;
+        }
+        if (notePath) {
+          task.notePath = notePath;
+        }
+        const logSummary = noteId
+          ? `${agent} 调用了 ${tool}（任务 ${task.id}，笔记 ${noteId}）`
+          : `${agent} 调用了 ${tool}（任务 ${task.id}）`;
+        progressLogs.value.push(logSummary);
+        if (activeTaskId.value === task.id) {
+          pulse(toolHighlight);
+        }
+      } else {
+        progressLogs.value.push(`${agent} 调用了 ${tool}`);
+      }
+      return;
+    }
+
+    if (eventType === "final_report") {
+      const report =
+        typeof mergedEvent.report === "string" && mergedEvent.report.trim()
+          ? mergedEvent.report.trim()
+          : "";
+      reportMarkdown.value = report || "报告生成失败，未获得有效内容";
+      pulse(reportHighlight);
+      progressLogs.value.push("最终报告已生成");
+      return;
+    }
+
+    if (eventType === "error") {
+      const detail =
+        typeof mergedEvent.detail === "string" && mergedEvent.detail.trim()
+          ? mergedEvent.detail
+          : "研究过程中发生错误";
+      error.value = detail;
+      progressLogs.value.push("研究失败，已停止流程");
+    }
+  };
+
   try {
-    await runResearchStream(
-      payload,
-      (event: ResearchStreamEvent) => {
-        if (event.type === "status") {
-          const message =
-            typeof event.message === "string" && event.message.trim()
-              ? event.message
-              : "流程状态更新";
-          progressLogs.value.push(message);
-
-          const payload = event as Record<string, unknown>;
-          const task = findTask(payload.task_id);
-          if (task && message) {
-            task.notices.push(message);
-            applyNoteMetadata(task, payload);
-          }
-          return;
+    let attempt = 0;
+    while (attempt <= MAX_RESUME_ATTEMPTS) {
+      try {
+        await runResearchStream(
+          {
+            ...payload,
+            run_id: runId.value,
+            trace_id: traceId.value,
+            resume_from_sequence: lastSequence.value
+          },
+          onEvent,
+          { signal: controller.signal }
+        );
+        break;
+      } catch (streamErr) {
+        if (streamErr instanceof DOMException && streamErr.name === "AbortError") {
+          throw streamErr;
         }
-
-        if (event.type === "todo_list") {
-          const tasks = Array.isArray(event.tasks)
-            ? (event.tasks as Record<string, unknown>[])
-            : [];
-
-          todoTasks.value = tasks.map((item, index) => {
-            const rawId =
-              typeof item.id === "number"
-                ? item.id
-                : typeof item.id === "string"
-                ? Number(item.id)
-                : index + 1;
-            const id = Number.isFinite(rawId) ? Number(rawId) : index + 1;
-            const noteId =
-              typeof item.note_id === "string" && item.note_id.trim()
-                ? item.note_id.trim()
-                : null;
-            const notePath =
-              typeof item.note_path === "string" && item.note_path.trim()
-                ? item.note_path.trim()
-                : null;
-
-            return {
-              id,
-              title:
-                typeof item.title === "string" && item.title.trim()
-                  ? item.title.trim()
-                  : `任务${id}`,
-              intent:
-                typeof item.intent === "string" && item.intent.trim()
-                  ? item.intent.trim()
-                  : "探索与主题相关的关键信息",
-              query:
-                typeof item.query === "string" && item.query.trim()
-                  ? item.query.trim()
-                  : form.topic.trim(),
-              status:
-                typeof item.status === "string" && item.status.trim()
-                  ? item.status.trim()
-                  : "pending",
-              summary: "",
-              sourcesSummary: "",
-              sourceItems: [],
-              notices: [],
-              noteId,
-              notePath,
-              toolCalls: []
-            } as TodoTaskView;
-          });
-
-          if (todoTasks.value.length) {
-            activeTaskId.value = todoTasks.value[0].id;
-            progressLogs.value.push("已生成任务清单");
-          } else {
-            progressLogs.value.push("未生成任务清单，使用默认任务继续");
-          }
-          return;
+        if (attempt >= MAX_RESUME_ATTEMPTS) {
+          throw streamErr;
         }
-
-        if (event.type === "task_status") {
-          const payload = event as Record<string, unknown>;
-          const task = findTask(event.task_id);
-          if (!task) {
-            return;
-          }
-
-          upsertTaskMetadata(task, payload);
-          applyNoteMetadata(task, payload);
-          const status =
-            typeof event.status === "string" && event.status.trim()
-              ? event.status.trim()
-              : task.status;
-          task.status = status;
-
-          if (status === "in_progress") {
-            task.summary = "";
-            task.sourcesSummary = "";
-            task.sourceItems = [];
-            task.notices = [];
-            activeTaskId.value = task.id;
-            progressLogs.value.push(`开始执行任务：${task.title}`);
-          } else if (status === "completed") {
-            if (typeof event.summary === "string" && event.summary.trim()) {
-              task.summary = event.summary.trim();
-            }
-            if (
-              typeof event.sources_summary === "string" &&
-              event.sources_summary.trim()
-            ) {
-              task.sourcesSummary = event.sources_summary.trim();
-              task.sourceItems = parseSources(task.sourcesSummary);
-            }
-            progressLogs.value.push(`完成任务：${task.title}`);
-            if (activeTaskId.value === task.id) {
-              pulse(summaryHighlight);
-              pulse(sourcesHighlight);
-            }
-          } else if (status === "skipped") {
-            progressLogs.value.push(`任务跳过：${task.title}`);
-          }
-          return;
-        }
-
-        if (event.type === "sources") {
-          const payload = event as Record<string, unknown>;
-          const task = findTask(event.task_id);
-          if (!task) {
-            return;
-          }
-
-          const textCandidates = [
-            payload.latest_sources,
-            payload.sources_summary,
-            payload.raw_context
-          ];
-          const latestText = textCandidates
-            .map((value) => (typeof value === "string" ? value.trim() : ""))
-            .find((value) => value);
-
-          if (latestText) {
-            task.sourcesSummary = latestText;
-            task.sourceItems = parseSources(latestText);
-            if (activeTaskId.value === task.id) {
-              pulse(sourcesHighlight);
-            }
-            progressLogs.value.push(`已更新任务来源：${task.title}`);
-          }
-
-          if (typeof payload.backend === "string") {
-            progressLogs.value.push(
-              `当前使用搜索后端：${payload.backend}`
-            );
-          }
-
-          applyNoteMetadata(task, payload);
-
-          return;
-        }
-
-        if (event.type === "task_summary_chunk") {
-          const payload = event as Record<string, unknown>;
-          const task = findTask(event.task_id);
-          if (!task) {
-            return;
-          }
-          const chunk =
-            typeof event.content === "string" ? event.content : "";
-          task.summary += chunk;
-          applyNoteMetadata(task, payload);
-          if (activeTaskId.value === task.id) {
-            pulse(summaryHighlight);
-          }
-          return;
-        }
-
-        if (event.type === "tool_call") {
-          const payload = event as Record<string, unknown>;
-          const eventId =
-            typeof payload.event_id === "number"
-              ? payload.event_id
-              : Date.now();
-          const agent =
-            typeof payload.agent === "string" && payload.agent.trim()
-              ? payload.agent.trim()
-              : "Agent";
-          const tool =
-            typeof payload.tool === "string" && payload.tool.trim()
-              ? payload.tool.trim()
-              : "tool";
-          const parameters = ensureRecord(payload.parameters);
-          const result =
-            typeof payload.result === "string" ? payload.result : "";
-          const noteId = extractOptionalString(payload.note_id);
-          const notePath = extractOptionalString(payload.note_path);
-
-          const task = findTask(payload.task_id);
-          if (task) {
-            task.toolCalls.push({
-              eventId,
-              agent,
-              tool,
-              parameters,
-              result,
-              noteId,
-              notePath,
-              timestamp: Date.now()
-            });
-            if (noteId) {
-              task.noteId = noteId;
-            }
-            if (notePath) {
-              task.notePath = notePath;
-            }
-            const logSummary = noteId
-              ? `${agent} 调用了 ${tool}（任务 ${task.id}，笔记 ${noteId}）`
-              : `${agent} 调用了 ${tool}（任务 ${task.id}）`;
-            progressLogs.value.push(logSummary);
-            if (activeTaskId.value === task.id) {
-              pulse(toolHighlight);
-            }
-          } else {
-            progressLogs.value.push(`${agent} 调用了 ${tool}`);
-          }
-          return;
-        }
-
-        if (event.type === "final_report") {
-          const report =
-            typeof event.report === "string" && event.report.trim()
-              ? event.report.trim()
-              : "";
-          reportMarkdown.value = report || "报告生成失败，未获得有效内容";
-          pulse(reportHighlight);
-          progressLogs.value.push("最终报告已生成");
-          return;
-        }
-
-        if (event.type === "error") {
-          const detail =
-            typeof event.detail === "string" && event.detail.trim()
-              ? event.detail
-              : "研究过程中发生错误";
-          error.value = detail;
-          progressLogs.value.push("研究失败，已停止流程");
-        }
-      },
-      { signal: controller.signal }
-    );
+        attempt += 1;
+        progressLogs.value.push(
+          `连接中断，正在从事件序号 ${lastSequence.value} 继续（第 ${attempt} 次）`
+        );
+      }
+    }
 
     if (!reportMarkdown.value) {
       reportMarkdown.value = "暂无生成的报告";

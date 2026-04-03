@@ -4,6 +4,9 @@ const baseURL =
 export interface ResearchRequest {
   topic: string;
   search_api?: string;
+  run_id?: string;
+  trace_id?: string;
+  resume_from_sequence?: number;
 }
 
 export interface ResearchStreamEvent {
@@ -55,14 +58,40 @@ export async function runResearchStream(
       const rawEvent = buffer.slice(0, boundary).trim();
       buffer = buffer.slice(boundary + 2);
 
-      if (rawEvent.startsWith("data:")) {
-        const dataPayload = rawEvent.slice(5).trim();
+      if (rawEvent) {
+        const lines = rawEvent.split("\n");
+        let dataPayload = "";
+        let sequence: number | undefined;
+
+        for (const line of lines) {
+          if (line.startsWith("id:")) {
+            const value = Number(line.slice(3).trim());
+            if (Number.isFinite(value)) {
+              sequence = value;
+            }
+          }
+          if (line.startsWith("data:")) {
+            dataPayload += line.slice(5).trim();
+          }
+        }
+
         if (dataPayload) {
           try {
             const event = JSON.parse(dataPayload) as ResearchStreamEvent;
+            if (sequence !== undefined && typeof event.sequence !== "number") {
+              event.sequence = sequence;
+            }
+
             onEvent(event);
 
-            if (event.type === "error" || event.type === "done") {
+            const eventType =
+              typeof event.event_type === "string"
+                ? event.event_type
+                : typeof event.type === "string"
+                ? event.type
+                : "";
+
+            if (eventType === "error" || eventType === "done") {
               return;
             }
           } catch (error) {
@@ -78,15 +107,31 @@ export async function runResearchStream(
       // 处理可能的尾巴事件
       if (buffer.trim()) {
         const rawEvent = buffer.trim();
-        if (rawEvent.startsWith("data:")) {
-          const dataPayload = rawEvent.slice(5).trim();
-          if (dataPayload) {
-            try {
-              const event = JSON.parse(dataPayload) as ResearchStreamEvent;
-              onEvent(event);
-            } catch (error) {
-              console.error("解析流式事件失败：", error, dataPayload);
+        const lines = rawEvent.split("\n");
+        let dataPayload = "";
+        let sequence: number | undefined;
+
+        for (const line of lines) {
+          if (line.startsWith("id:")) {
+            const value = Number(line.slice(3).trim());
+            if (Number.isFinite(value)) {
+              sequence = value;
             }
+          }
+          if (line.startsWith("data:")) {
+            dataPayload += line.slice(5).trim();
+          }
+        }
+
+        if (dataPayload) {
+          try {
+            const event = JSON.parse(dataPayload) as ResearchStreamEvent;
+            if (sequence !== undefined && typeof event.sequence !== "number") {
+              event.sequence = sequence;
+            }
+            onEvent(event);
+          } catch (error) {
+            console.error("解析流式事件失败：", error, dataPayload);
           }
         }
       }

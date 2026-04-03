@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Iterator, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -14,6 +15,8 @@ from pydantic import BaseModel, Field
 
 from config import Configuration, SearchAPI
 from agent import DeepResearchAgent
+
+logger.remove()
 
 # 添加控制台日志处理程序
 logger.add(
@@ -41,6 +44,19 @@ class ResearchRequest(BaseModel):
         default=None,
         description="Override the default search backend configured via env",
     )
+    run_id: str | None = Field(
+        default=None,
+        description="Optional idempotent run identifier for resume/retry",
+    )
+    trace_id: str | None = Field(
+        default=None,
+        description="Optional distributed trace identifier",
+    )
+    resume_from_sequence: int = Field(
+        default=0,
+        ge=0,
+        description="Replay events whose sequence is greater than this value",
+    )
 
 
 class ResearchResponse(BaseModel):
@@ -53,6 +69,8 @@ class ResearchResponse(BaseModel):
         default_factory=list,
         description="Structured TODO items with summaries and sources",
     )
+    run_id: str = Field(..., description="Stable run identifier")
+    trace_id: str = Field(..., description="Trace identifier")
 
 
 def _mask_secret(value: Optional[str], visible: int = 4) -> str:
@@ -75,8 +93,40 @@ def _build_config(payload: ResearchRequest) -> Configuration:
     return Configuration.from_env(overrides=overrides)
 
 
+def _log_startup_configuration() -> None:
+    """Log effective runtime configuration once on app startup."""
+
+    config = Configuration.from_env()
+
+    if config.llm_provider == "ollama":
+        base_url = config.sanitized_ollama_url()
+    elif config.llm_provider == "lmstudio":
+        base_url = config.lmstudio_base_url
+    else:
+        base_url = config.llm_base_url or "unset"
+
+    logger.info(
+        "DeepResearch configuration loaded: provider={} model={} base_url={} search_api={} "
+        "max_loops={} fetch_full_page={} tool_calling={} strip_thinking={} api_key={}",
+        config.llm_provider,
+        config.resolved_model() or "unset",
+        base_url,
+        (config.search_api.value if isinstance(config.search_api, SearchAPI) else config.search_api),
+        config.max_web_research_loops,
+        config.fetch_full_page,
+        config.use_tool_calling,
+        config.strip_thinking_tokens,
+        _mask_secret(config.llm_api_key),
+    )
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="HelloAgents Deep Researcher")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        _log_startup_configuration()
+        yield
+
+    app = FastAPI(title="HelloAgents Deep Researcher", lifespan=lifespan)
 
     app.add_middleware(
         CORSMiddleware,
@@ -85,31 +135,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.on_event("startup")
-    def log_startup_configuration() -> None:
-        config = Configuration.from_env()
-
-        if config.llm_provider == "ollama":
-            base_url = config.sanitized_ollama_url()
-        elif config.llm_provider == "lmstudio":
-            base_url = config.lmstudio_base_url
-        else:
-            base_url = config.llm_base_url or "unset"
-
-        logger.info(
-            "DeepResearch configuration loaded: provider=%s model=%s base_url=%s search_api=%s "
-            "max_loops=%s fetch_full_page=%s tool_calling=%s strip_thinking=%s api_key=%s",
-            config.llm_provider,
-            config.resolved_model() or "unset",
-            base_url,
-            (config.search_api.value if isinstance(config.search_api, SearchAPI) else config.search_api),
-            config.max_web_research_loops,
-            config.fetch_full_page,
-            config.use_tool_calling,
-            config.strip_thinking_tokens,
-            _mask_secret(config.llm_api_key),
-        )
 
     @app.get("/healthz")
     def health_check() -> Dict[str, str]:
@@ -120,7 +145,11 @@ def create_app() -> FastAPI:
         try:
             config = _build_config(payload)
             agent = DeepResearchAgent(config=config)
-            result = agent.run(payload.topic)
+            result = agent.run(
+                payload.topic,
+                run_id=payload.run_id,
+                trace_id=payload.trace_id,
+            )
         except ValueError as exc:  # Likely due to unsupported configuration
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -144,6 +173,8 @@ def create_app() -> FastAPI:
         return ResearchResponse(
             report_markdown=(result.report_markdown or result.running_summary or ""),
             todo_items=todo_payload,
+            run_id=result.run_id,
+            trace_id=result.trace_id,
         )
 
     @app.post("/research/stream")
@@ -156,7 +187,15 @@ def create_app() -> FastAPI:
 
         def event_iterator() -> Iterator[str]:
             try:
-                for event in agent.run_stream(payload.topic):
+                for event in agent.run_stream(
+                    payload.topic,
+                    run_id=payload.run_id,
+                    trace_id=payload.trace_id,
+                    resume_from_sequence=payload.resume_from_sequence,
+                ):
+                    sequence = event.get("sequence")
+                    if isinstance(sequence, int):
+                        yield f"id: {sequence}\n"
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as exc:  # pragma: no cover - defensive guardrail
                 logger.exception("Streaming research failed")

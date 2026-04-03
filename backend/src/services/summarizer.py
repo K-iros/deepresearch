@@ -7,11 +7,12 @@ from typing import Tuple
 
 from hello_agents import ToolAwareSimpleAgent
 
+from contracts import CONTRACT_VERSION, TaskSummaryContract
 from models import SummaryState, TodoItem
 from config import Configuration
 from utils import strip_thinking_tokens
 from services.notes import build_note_guidance
-from services.text_processing import strip_tool_calls
+from services.text_processing import sanitize_markdown_html, strip_tool_calls
 
 
 class SummarizationService:
@@ -41,8 +42,10 @@ class SummarizationService:
             summary_text = strip_thinking_tokens(summary_text)
 
         summary_text = strip_tool_calls(summary_text).strip()
+        summary_text = sanitize_markdown_html(summary_text)
 
-        return summary_text or "暂无可用信息"
+        contract = self._build_contract(task, summary_text)
+        return contract.summary_markdown or "暂无可用信息"
 
     def stream_task_summary(
         self, state: SummaryState, task: TodoItem, context: str
@@ -107,7 +110,10 @@ class SummarizationService:
             else:
                 cleaned = visible_output
 
-            return strip_tool_calls(cleaned).strip()
+            normalized = strip_tool_calls(cleaned).strip()
+            normalized = sanitize_markdown_html(normalized)
+            contract = self._build_contract(task, normalized)
+            return contract.summary_markdown
 
         return generator(), get_summary
 
@@ -122,4 +128,20 @@ class SummarizationService:
             f"任务上下文：\n{context}\n"
             f"{build_note_guidance(task)}\n"
             "请按照以上协作要求先同步笔记，然后返回一份面向用户的 Markdown 总结（仍遵循任务总结模板）。"
+        )
+
+    def _build_contract(self, task: TodoItem, summary_markdown: str) -> TaskSummaryContract:
+        """Build a validated summary contract to avoid implicit text coupling."""
+
+        findings = [
+            line.strip("- ").strip()
+            for line in summary_markdown.splitlines()
+            if line.strip().startswith(("-", "*"))
+        ]
+
+        return TaskSummaryContract(
+            version=CONTRACT_VERSION,
+            task_id=task.id,
+            summary_markdown=summary_markdown or "暂无可用信息",
+            key_findings=findings[:8],
         )

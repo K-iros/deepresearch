@@ -6,10 +6,11 @@ import json
 
 from hello_agents import ToolAwareSimpleAgent
 
+from contracts import CONTRACT_VERSION, ReportContract
 from models import SummaryState
 from config import Configuration
 from utils import strip_thinking_tokens
-from services.text_processing import strip_tool_calls
+from services.text_processing import sanitize_markdown_html, strip_tool_calls
 
 
 class ReportingService:
@@ -72,6 +73,35 @@ class ReportingService:
             report_text = strip_thinking_tokens(report_text)
 
         report_text = strip_tool_calls(report_text).strip()
+        report_text = sanitize_markdown_html(report_text)
 
-        return report_text or "报告生成失败，请检查输入。"
+        contract = ReportContract(
+            version=CONTRACT_VERSION,
+            report_markdown=report_text or "报告生成失败，请检查输入。",
+            sections=self._extract_sections(report_text),
+        )
+        return contract.report_markdown
+
+    def _extract_sections(self, report_text: str) -> dict[str, str]:
+        """Extract markdown sections for validated structured consumption."""
+
+        if not report_text:
+            return {}
+
+        sections: dict[str, str] = {}
+        current_header = "正文"
+        lines: list[str] = []
+        for line in report_text.splitlines():
+            if line.startswith("#"):
+                if lines:
+                    sections[current_header] = "\n".join(lines).strip()
+                    lines = []
+                current_header = line.lstrip("#").strip() or "正文"
+                continue
+            lines.append(line)
+
+        if lines:
+            sections[current_header] = "\n".join(lines).strip()
+
+        return sections
 

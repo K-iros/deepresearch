@@ -9,6 +9,7 @@ from typing import Any, List, Optional
 
 from hello_agents import ToolAwareSimpleAgent
 
+from contracts import CONTRACT_VERSION, PlannerOutputContract, RetryPolicy
 from models import SummaryState, TodoItem
 from config import Configuration
 from prompts import get_current_date, todo_planner_instructions
@@ -42,21 +43,28 @@ class PlanningService:
         logger.info("Planner raw output (truncated): %s", response[:500])
 
         tasks_payload = self._extract_tasks(response)
+        contract = PlannerOutputContract(version=CONTRACT_VERSION, tasks=tasks_payload)
         todo_items: List[TodoItem] = []
 
-        for idx, item in enumerate(tasks_payload, start=1):
-            title = str(item.get("title") or f"任务{idx}").strip()
-            intent = str(item.get("intent") or "聚焦主题的关键问题").strip()
-            query = str(item.get("query") or state.research_topic).strip()
+        for idx, item in enumerate(contract.tasks, start=1):
+            title = str(item.title or f"任务{idx}").strip()
+            intent = str(item.intent or "聚焦主题的关键问题").strip()
+            query = str(item.query or state.research_topic).strip()
 
             if not query:
                 query = state.research_topic
+
+            retry_policy: RetryPolicy = item.retry_policy
 
             task = TodoItem(
                 id=idx,
                 title=title,
                 intent=intent,
                 query=query,
+                depends_on=[dep for dep in item.depends_on if dep > 0 and dep != idx],
+                priority=int(item.priority),
+                retry_max_attempts=int(retry_policy.max_attempts),
+                retry_backoff_seconds=float(retry_policy.backoff_seconds),
             )
             todo_items.append(task)
 
@@ -75,6 +83,9 @@ class PlanningService:
             title="基础背景梳理",
             intent="收集主题的核心背景与最新动态",
             query=f"{state.research_topic} 最新进展" if state.research_topic else "基础背景梳理",
+            priority=50,
+            retry_max_attempts=2,
+            retry_backoff_seconds=0.0,
         )
 
     # ------------------------------------------------------------------
@@ -108,7 +119,27 @@ class PlanningService:
                     if isinstance(item, dict):
                         tasks.append(item)
 
-        return tasks
+        normalized: List[dict[str, Any]] = []
+        for item in tasks:
+            retry_payload = item.get("retry_policy")
+            if not isinstance(retry_payload, dict):
+                retry_payload = {
+                    "max_attempts": 2,
+                    "backoff_seconds": 0.0,
+                }
+
+            normalized.append(
+                {
+                    "title": item.get("title") or "任务",
+                    "intent": item.get("intent") or "聚焦主题的关键问题",
+                    "query": item.get("query") or "",
+                    "depends_on": item.get("depends_on") or [],
+                    "priority": item.get("priority", 50),
+                    "retry_policy": retry_payload,
+                }
+            )
+
+        return normalized
 
     def _extract_json_payload(self, text: str) -> Optional[dict[str, Any] | list]:
         """Try to locate and parse a JSON object or array from the text."""

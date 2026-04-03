@@ -1,10 +1,10 @@
 from datetime import datetime
 
 
-# Get current date in a readable format
-def get_current_date():
-    return datetime.now().strftime("%B %d, %Y")
+def get_current_date() -> str:
+    """Get current date in a readable format."""
 
+    return datetime.now().strftime("%B %d, %Y")
 
 
 todo_planner_system_prompt = """
@@ -24,14 +24,12 @@ todo_planner_system_prompt = """
 - 为每个任务调用 `note` 工具创建/更新结构化笔记，统一使用 JSON 参数格式：
   - 创建示例：`[TOOL_CALL:note:{"action":"create","task_id":1,"title":"任务 1: 背景梳理","note_type":"task_state","tags":["deep_research","task_1"],"content":"请记录任务概览、系统提示、来源概览、任务总结"}]`
   - 更新示例：`[TOOL_CALL:note:{"action":"update","note_id":"<现有ID>","task_id":1,"title":"任务 1: 背景梳理","note_type":"task_state","tags":["deep_research","task_1"],"content":"...新增内容..."}]`
-- `tags` 必须包含 `deep_research` 与 `task_{task_id}`，以便其他 Agent 查找
+- `tags` 必须包含 `deep_research` 与 `task_{task_id}`，以便其他 Agent 查找。
 </NOTE_COLLAB>
 
 <TOOLS>
 你必须调用名为 `note` 的笔记工具来记录或更新待办任务，参数统一使用 JSON：
-```
-[TOOL_CALL:note:{"action":"create","task_id":1,"title":"任务 1: 背景梳理","note_type":"task_state","tags":["deep_research","task_1"],"content":"..."}]
-```
+`[TOOL_CALL:note:{"action":"create","task_id":1,"title":"任务 1: 背景梳理","note_type":"task_state","tags":["deep_research","task_1"],"content":"..."}]`
 </TOOLS>
 """
 
@@ -46,17 +44,29 @@ todo_planner_instructions = """
 <FORMAT>
 请严格以 JSON 格式回复：
 {{
+  "version": "1.0.0",
   "tasks": [
     {{
       "title": "任务名称（10字内，突出重点）",
       "intent": "任务要解决的核心问题，用1-2句描述",
-      "query": "建议使用的检索关键词"
+      "query": "建议使用的检索关键词",
+      "depends_on": [1],
+      "priority": 50,
+      "retry_policy": {{
+        "max_attempts": 2,
+        "backoff_seconds": 0
+      }}
     }}
   ]
 }}
 </FORMAT>
 
-如果主题信息不足以规划任务，请输出空数组：{{"tasks": []}}。必要时使用笔记工具记录你的思考过程。
+约束：
+- depends_on 只能引用当前任务列表中已存在的任务编号；
+- priority 范围 0~100，数值越高优先级越高；
+- retry_policy.max_attempts 范围 1~5。
+
+如果主题信息不足以规划任务，请输出：{{"version":"1.0.0","tasks": []}}。必要时使用笔记工具记录你的思考过程。
 """
 
 

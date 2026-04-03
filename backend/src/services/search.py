@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import sys
+from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 
 from hello_agents.tools import SearchTool
 
+from contracts import SearchBundleContract, SearchDocumentContract
 from config import Configuration
 from utils import (
     deduplicate_and_format_sources,
@@ -17,20 +20,37 @@ from utils import (
 logger = logging.getLogger(__name__)
 
 MAX_TOKENS_PER_SOURCE = 2000
-_GLOBAL_SEARCH_TOOL = SearchTool(backend="hybrid")
+_GLOBAL_SEARCH_TOOL: SearchTool | None = None
+
+
+def _get_search_tool() -> SearchTool:
+    global _GLOBAL_SEARCH_TOOL
+
+    if _GLOBAL_SEARCH_TOOL is not None:
+        return _GLOBAL_SEARCH_TOOL
+
+    # Some Windows terminals default to GBK and crash when upstream prints emoji.
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="ignore")
+    except Exception:  # pragma: no cover - best effort only
+        pass
+
+    _GLOBAL_SEARCH_TOOL = SearchTool(backend="hybrid")
+    return _GLOBAL_SEARCH_TOOL
 
 
 def dispatch_search(
     query: str,
     config: Configuration,
     loop_count: int,
-) -> Tuple[dict[str, Any] | None, list[str], Optional[str], str]:
+) -> Tuple[SearchBundleContract, str]:
     """Execute configured search backend and normalise response payload."""
 
     search_api = get_config_value(config.search_api)
 
     try:
-        raw_response = _GLOBAL_SEARCH_TOOL.run(
+        raw_response = _get_search_tool().run(
             {
                 "input": query,
                 "backend": search_api,
@@ -62,6 +82,39 @@ def dispatch_search(
     answer_text = payload.get("answer")
     results = payload.get("results", [])
 
+    documents: list[SearchDocumentContract] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+
+        source_type = "web"
+        if isinstance(item.get("source_type"), str) and item.get("source_type") in {
+            "web",
+            "news",
+            "academic",
+            "other",
+        }:
+            source_type = str(item.get("source_type"))
+
+        documents.append(
+            SearchDocumentContract(
+                title=str(item.get("title") or item.get("url") or ""),
+                summary=str(item.get("content") or item.get("snippet") or ""),
+                url=item.get("url"),
+                confidence=float(item.get("score") or 0.5),
+                source_type=source_type,  # type: ignore[arg-type]
+                fetched_at=str(item.get("fetched_at") or datetime.now(timezone.utc).isoformat()),
+                raw_content=str(item.get("raw_content") or ""),
+            )
+        )
+
+    bundle = SearchBundleContract(
+        backend=backend_label,
+        answer=str(answer_text) if answer_text else None,
+        notices=notices,
+        documents=documents,
+    )
+
     if notices:
         for notice in notices:
             logger.info("Search notice (%s): %s", backend_label, notice)
@@ -74,24 +127,38 @@ def dispatch_search(
         len(results),
     )
 
-    return payload, notices, answer_text, backend_label
+    return bundle, backend_label
 
 
 def prepare_research_context(
-    search_result: dict[str, Any] | None,
-    answer_text: Optional[str],
+    search_result: SearchBundleContract,
     config: Configuration,
 ) -> tuple[str, str]:
     """Build structured context and source summary for downstream agents."""
 
-    sources_summary = format_sources(search_result)
+    source_payload = {
+        "results": [
+            {
+                "title": item.title,
+                "url": str(item.url) if item.url else "",
+                "content": item.summary,
+                "raw_content": item.raw_content,
+                "confidence": item.confidence,
+                "source_type": item.source_type,
+                "fetched_at": item.fetched_at,
+            }
+            for item in search_result.documents
+        ]
+    }
+
+    sources_summary = format_sources(source_payload)
     context = deduplicate_and_format_sources(
-        search_result or {"results": []},
+        source_payload,
         max_tokens_per_source=MAX_TOKENS_PER_SOURCE,
         fetch_full_page=config.fetch_full_page,
     )
 
-    if answer_text:
-        context = f"AI直接答案：\n{answer_text}\n\n{context}"
+    if search_result.answer:
+        context = f"AI直接答案：\n{search_result.answer}\n\n{context}"
 
     return sources_summary, context

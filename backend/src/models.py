@@ -15,7 +15,13 @@ class TodoItem:
     title: str
     intent: str
     query: str
+    depends_on: list[int] = field(default_factory=list)
+    priority: int = field(default=50)
+    retry_max_attempts: int = field(default=2)
+    retry_backoff_seconds: float = field(default=0.0)
     status: str = field(default="pending")
+    attempt_count: int = field(default=0)
+    last_error: Optional[str] = field(default=None)
     summary: Optional[str] = field(default=None)
     sources_summary: Optional[str] = field(default=None)
     notices: list[str] = field(default_factory=list)
@@ -27,6 +33,9 @@ class TodoItem:
 @dataclass(kw_only=True)
 class SummaryState:
     research_topic: str = field(default=None)  # Report topic
+    run_id: str = field(default="")
+    trace_id: str = field(default="")
+    next_sequence: int = field(default=1)
     search_query: str = field(default=None)  # Deprecated placeholder
     web_research_results: Annotated[list, operator.add] = field(default_factory=list)
     sources_gathered: Annotated[list, operator.add] = field(default_factory=list)
@@ -36,6 +45,7 @@ class SummaryState:
     structured_report: Optional[str] = field(default=None)
     report_note_id: Optional[str] = field(default=None)
     report_note_path: Optional[str] = field(default=None)
+    completed: bool = field(default=False)
 
 
 @dataclass(kw_only=True)
@@ -48,4 +58,6 @@ class SummaryStateOutput:
     running_summary: str = field(default=None)  # Backward-compatible文本
     report_markdown: Optional[str] = field(default=None)
     todo_items: List[TodoItem] = field(default_factory=list)
+    run_id: str = field(default="")
+    trace_id: str = field(default="")
 
