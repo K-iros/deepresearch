@@ -35,6 +35,8 @@ class SummaryState:
     research_topic: str = field(default=None)  # Report topic
     run_id: str = field(default="")
     trace_id: str = field(default="")
+    created_at: Optional[str] = field(default=None)
+    updated_at: Optional[str] = field(default=None)
     next_sequence: int = field(default=1)
     search_query: str = field(default=None)  # Deprecated placeholder
     web_research_results: Annotated[list, operator.add] = field(default_factory=list)
@@ -45,6 +47,12 @@ class SummaryState:
     structured_report: Optional[str] = field(default=None)
     report_note_id: Optional[str] = field(default=None)
     report_note_path: Optional[str] = field(default=None)
+    artifact_root: Optional[str] = field(default=None)
+    artifact_paths: list[str] = field(default_factory=list)
+    runtime_mode: str = field(default="standard")
+    max_sources: int = field(default=5)
+    task_concurrency: int = field(default=2)
+    stage_durations: dict[str, float] = field(default_factory=dict)
     completed: bool = field(default=False)
 
 

@@ -108,6 +108,40 @@ class Configuration(BaseModel):
         title="LLM Model ID",
         description="Optional model identifier for custom OpenAI-compatible services",
     )
+    runtime_mode: str = Field(
+        default="standard",
+        title="Runtime Mode",
+        description="Runtime profile: quick, standard, deep",
+    )
+    max_sources: int = Field(
+        default=0,
+        ge=0,
+        le=20,
+        title="Max Sources",
+        description="Maximum sources fetched per search task; 0 means using mode defaults",
+    )
+    task_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        title="Task Concurrency",
+        description="Maximum number of ready tasks executed concurrently",
+    )
+    planner_model_id: Optional[str] = Field(
+        default=None,
+        title="Planner Model ID",
+        description="Optional model override for planning stage",
+    )
+    summarizer_model_id: Optional[str] = Field(
+        default=None,
+        title="Summarizer Model ID",
+        description="Optional model override for summarization stage",
+    )
+    reporter_model_id: Optional[str] = Field(
+        default=None,
+        title="Reporter Model ID",
+        description="Optional model override for report stage",
+    )
 
     @classmethod
     def from_env(cls, overrides: Optional[dict[str, Any]] = None) -> "Configuration":
@@ -137,6 +171,12 @@ class Configuration(BaseModel):
             "search_api": os.getenv("SEARCH_API"),
             "enable_notes": os.getenv("ENABLE_NOTES"),
             "notes_workspace": os.getenv("NOTES_WORKSPACE"),
+            "runtime_mode": os.getenv("RUNTIME_MODE"),
+            "max_sources": os.getenv("MAX_SOURCES"),
+            "task_concurrency": os.getenv("TASK_CONCURRENCY"),
+            "planner_model_id": os.getenv("PLANNER_MODEL_ID"),
+            "summarizer_model_id": os.getenv("SUMMARIZER_MODEL_ID"),
+            "reporter_model_id": os.getenv("REPORTER_MODEL_ID"),
         }
 
         for key, value in env_aliases.items():
@@ -162,4 +202,30 @@ class Configuration(BaseModel):
         """Best-effort resolution of the model identifier to use."""
 
         return self.llm_model_id or self.local_llm
+
+    def normalized_runtime_mode(self) -> str:
+        mode = (self.runtime_mode or "standard").strip().lower()
+        if mode not in {"quick", "standard", "deep"}:
+            return "standard"
+        return mode
+
+    def resolved_max_sources(self) -> int:
+        mode_defaults = {"quick": 3, "standard": 5, "deep": 8}
+        mode = self.normalized_runtime_mode()
+
+        if int(self.max_sources or 0) > 0:
+            return int(self.max_sources)
+
+        return int(mode_defaults.get(mode, 5))
+
+    def resolved_task_concurrency(self) -> int:
+        return max(1, int(self.task_concurrency or 1))
+
+    def model_profile(self) -> dict[str, str]:
+        default_model = self.resolved_model() or ""
+        return {
+            "planner": (self.planner_model_id or default_model),
+            "summarizer": (self.summarizer_model_id or default_model),
+            "reporter": (self.reporter_model_id or default_model),
+        }
 

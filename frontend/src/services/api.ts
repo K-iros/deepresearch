@@ -7,6 +7,9 @@ export interface ResearchRequest {
   run_id?: string;
   trace_id?: string;
   resume_from_sequence?: number;
+  mode?: string;
+  max_sources?: number;
+  concurrency?: number;
 }
 
 export interface ResearchStreamEvent {
@@ -18,12 +21,60 @@ export interface StreamOptions {
   signal?: AbortSignal;
 }
 
-export async function runResearchStream(
-  payload: ResearchRequest,
+export interface RunListItem {
+  run_id: string;
+  topic: string;
+  friendly_name: string;
+  status: string;
+  progress: number;
+  created_at: string;
+  updated_at: string;
+  completed: boolean;
+}
+
+export interface RunListResponse {
+  items: RunListItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface RuntimeOptions {
+  mode: string;
+  max_sources: number;
+  concurrency: number;
+  stage_duration_stats: Record<string, number>;
+  model_profile: Record<string, string>;
+}
+
+export interface ResumeRequest {
+  resume_from_sequence?: number;
+  search_api?: string;
+  trace_id?: string;
+  mode?: string;
+  max_sources?: number;
+  concurrency?: number;
+}
+
+function buildQueryString(params: Record<string, string | number | undefined>): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    query.set(key, String(value));
+  }
+  const text = query.toString();
+  return text ? `?${text}` : "";
+}
+
+async function streamFromEndpoint(
+  endpointPath: string,
+  payload: unknown,
   onEvent: (event: ResearchStreamEvent) => void,
   options: StreamOptions = {}
 ): Promise<void> {
-  const response = await fetch(`${baseURL}/research/stream`, {
+  const response = await fetch(`${baseURL}${endpointPath}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -35,9 +86,7 @@ export async function runResearchStream(
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "");
-    throw new Error(
-      errorText || `研究请求失败，状态码：${response.status}`
-    );
+    throw new Error(errorText || `研究请求失败，状态码：${response.status}`);
   }
 
   const body = response.body;
@@ -104,7 +153,6 @@ export async function runResearchStream(
     }
 
     if (done) {
-      // 处理可能的尾巴事件
       if (buffer.trim()) {
         const rawEvent = buffer.trim();
         const lines = rawEvent.split("\n");
@@ -138,4 +186,97 @@ export async function runResearchStream(
       break;
     }
   }
+}
+
+export async function runResearchStream(
+  payload: ResearchRequest,
+  onEvent: (event: ResearchStreamEvent) => void,
+  options: StreamOptions = {}
+): Promise<void> {
+  return streamFromEndpoint("/research/stream", payload, onEvent, options);
+}
+
+export async function resumeResearchRunStream(
+  runId: string,
+  payload: ResumeRequest,
+  onEvent: (event: ResearchStreamEvent) => void,
+  options: StreamOptions = {}
+): Promise<void> {
+  return streamFromEndpoint(`/research/runs/${encodeURIComponent(runId)}/resume`, payload, onEvent, options);
+}
+
+export async function listResearchRuns(params: {
+  status?: string;
+  keyword?: string;
+  page?: number;
+  page_size?: number;
+}): Promise<RunListResponse> {
+  const query = buildQueryString({
+    status: params.status,
+    keyword: params.keyword,
+    page: params.page,
+    page_size: params.page_size
+  });
+  const response = await fetch(`${baseURL}/research/runs${query}`, {
+    headers: {
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `获取历史运行列表失败，状态码：${response.status}`);
+  }
+
+  return (await response.json()) as RunListResponse;
+}
+
+export async function getResearchRunDetail(
+  runId: string,
+  latestEventsLimit = 50
+): Promise<Record<string, unknown>> {
+  const query = buildQueryString({ latest_events_limit: latestEventsLimit });
+  const response = await fetch(`${baseURL}/research/runs/${encodeURIComponent(runId)}${query}`, {
+    headers: {
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `获取历史运行详情失败，状态码：${response.status}`);
+  }
+
+  return (await response.json()) as Record<string, unknown>;
+}
+
+export async function getRuntimeOptions(): Promise<RuntimeOptions> {
+  const response = await fetch(`${baseURL}/research/runtime/options`, {
+    headers: {
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `获取运行时配置失败，状态码：${response.status}`);
+  }
+
+  return (await response.json()) as RuntimeOptions;
+}
+
+export async function deleteResearchRun(runId: string): Promise<{ ok: boolean; run_id: string }> {
+  const response = await fetch(`${baseURL}/research/runs/${encodeURIComponent(runId)}`, {
+    method: "DELETE",
+    headers: {
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(text || `删除历史记录失败，状态码：${response.status}`);
+  }
+
+  return (await response.json()) as { ok: boolean; run_id: string };
 }

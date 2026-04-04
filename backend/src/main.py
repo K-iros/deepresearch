@@ -7,7 +7,7 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Iterator, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from loguru import logger
@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from config import Configuration, SearchAPI
 from agent import DeepResearchAgent
+from services.run_store import RunStore
 
 logger.remove()
 
@@ -57,6 +58,33 @@ class ResearchRequest(BaseModel):
         ge=0,
         description="Replay events whose sequence is greater than this value",
     )
+    mode: str | None = Field(
+        default=None,
+        description="Runtime mode: quick, standard, deep",
+    )
+    max_sources: int | None = Field(
+        default=None,
+        ge=1,
+        le=20,
+        description="Override max sources per task",
+    )
+    concurrency: int | None = Field(
+        default=None,
+        ge=1,
+        le=8,
+        description="Override ready-task concurrency",
+    )
+
+
+class ResumeRunRequest(BaseModel):
+    """Payload for resuming a historical run."""
+
+    resume_from_sequence: int = Field(default=0, ge=0)
+    search_api: SearchAPI | None = Field(default=None)
+    trace_id: str | None = Field(default=None)
+    mode: str | None = Field(default=None)
+    max_sources: int | None = Field(default=None, ge=1, le=20)
+    concurrency: int | None = Field(default=None, ge=1, le=8)
 
 
 class ResearchResponse(BaseModel):
@@ -71,6 +99,24 @@ class ResearchResponse(BaseModel):
     )
     run_id: str = Field(..., description="Stable run identifier")
     trace_id: str = Field(..., description="Trace identifier")
+
+
+class RunListItem(BaseModel):
+    run_id: str
+    topic: str
+    friendly_name: str = ""
+    status: str
+    progress: int
+    created_at: str
+    updated_at: str
+    completed: bool
+
+
+class RunListResponse(BaseModel):
+    items: list[RunListItem]
+    total: int
+    page: int
+    page_size: int
 
 
 def _mask_secret(value: Optional[str], visible: int = 4) -> str:
@@ -89,8 +135,33 @@ def _build_config(payload: ResearchRequest) -> Configuration:
 
     if payload.search_api is not None:
         overrides["search_api"] = payload.search_api
+    if payload.mode is not None:
+        overrides["runtime_mode"] = payload.mode
+    if payload.max_sources is not None:
+        overrides["max_sources"] = payload.max_sources
+    if payload.concurrency is not None:
+        overrides["task_concurrency"] = payload.concurrency
 
     return Configuration.from_env(overrides=overrides)
+
+
+def _build_resume_config(payload: ResumeRunRequest) -> Configuration:
+    overrides: Dict[str, Any] = {}
+    if payload.search_api is not None:
+        overrides["search_api"] = payload.search_api
+    if payload.mode is not None:
+        overrides["runtime_mode"] = payload.mode
+    if payload.max_sources is not None:
+        overrides["max_sources"] = payload.max_sources
+    if payload.concurrency is not None:
+        overrides["task_concurrency"] = payload.concurrency
+    return Configuration.from_env(overrides=overrides)
+
+
+def _build_run_store(config: Configuration | None = None) -> RunStore:
+    cfg = config or Configuration.from_env()
+    run_workspace = cfg.notes_workspace or "./notes"
+    return RunStore(run_workspace)
 
 
 def _log_startup_configuration() -> None:
@@ -210,6 +281,98 @@ def create_app() -> FastAPI:
                 "Connection": "keep-alive",
             },
         )
+
+    @app.get("/research/runs", response_model=RunListResponse)
+    def list_research_runs(
+        status: str | None = Query(default=None),
+        keyword: str | None = Query(default=None),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+    ) -> RunListResponse:
+        store = _build_run_store()
+        payload = store.list_runs(
+            status=status,
+            keyword=keyword,
+            page=page,
+            page_size=page_size,
+        )
+        return RunListResponse(**payload)
+
+    @app.get("/research/runs/{run_id}")
+    def get_research_run_detail(
+        run_id: str,
+        latest_events_limit: int = Query(default=50, ge=1, le=200),
+    ) -> dict[str, Any]:
+        store = _build_run_store()
+        detail = store.get_run_detail(run_id, latest_events_limit=latest_events_limit)
+        if not detail:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return detail
+
+    @app.delete("/research/runs/{run_id}")
+    def delete_research_run(run_id: str) -> dict[str, Any]:
+        store = _build_run_store()
+        deleted = store.delete_run(run_id, remove_artifacts=True)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return {"ok": True, "run_id": run_id}
+
+    @app.post("/research/runs/{run_id}/resume")
+    def resume_research_run(run_id: str, payload: ResumeRunRequest) -> StreamingResponse:
+        config = _build_resume_config(payload)
+        store = _build_run_store(config)
+        doc = store.get(run_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        topic = str(doc.get("topic") or "").strip()
+        if not topic:
+            raise HTTPException(status_code=400, detail="Run topic is missing")
+
+        try:
+            agent = DeepResearchAgent(config=config)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        trace_id = payload.trace_id or str(doc.get("trace_id") or run_id)
+
+        def event_iterator() -> Iterator[str]:
+            try:
+                for event in agent.run_stream(
+                    topic,
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    resume_from_sequence=payload.resume_from_sequence,
+                ):
+                    sequence = event.get("sequence")
+                    if isinstance(sequence, int):
+                        yield f"id: {sequence}\n"
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except Exception as exc:  # pragma: no cover - defensive guardrail
+                logger.exception("Resuming streaming research failed")
+                error_payload = {"type": "error", "detail": str(exc)}
+                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_iterator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    @app.get("/research/runtime/options")
+    def get_runtime_options() -> dict[str, Any]:
+        config = Configuration.from_env()
+        store = _build_run_store(config)
+        return {
+            "mode": config.normalized_runtime_mode(),
+            "max_sources": config.resolved_max_sources(),
+            "concurrency": config.resolved_task_concurrency(),
+            "stage_duration_stats": store.aggregate_stage_duration_stats(),
+            "model_profile": config.model_profile(),
+        }
 
     return app
 

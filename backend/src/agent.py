@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterator
+from time import perf_counter
 from uuid import uuid4
 
 from hello_agents import HelloAgentsLLM, ToolAwareSimpleAgent
@@ -40,6 +45,7 @@ class DeepResearchAgent:
         self._ensure_utf8_stdout()
         self.config = config or Configuration.from_env()
         self.llm = self._init_llm()
+        self._model_profile = self.config.model_profile()
 
         self.note_tool = (
             NoteTool(workspace=self.config.notes_workspace)
@@ -63,15 +69,18 @@ class DeepResearchAgent:
         self.todo_agent = self._create_tool_aware_agent(
             name="研究规划专家",
             system_prompt=todo_planner_system_prompt.strip(),
+            model_override=self._model_profile.get("planner"),
         )
         self.report_agent = self._create_tool_aware_agent(
             name="报告撰写专家",
             system_prompt=report_writer_instructions.strip(),
+            model_override=self._model_profile.get("reporter"),
         )
 
         self._summarizer_factory: Callable[[], ToolAwareSimpleAgent] = lambda: self._create_tool_aware_agent(
             name="任务总结专家",
             system_prompt=task_summarizer_instructions.strip(),
+            model_override=self._model_profile.get("summarizer"),
         )
 
         self.planner = PlanningService(self.todo_agent, self.config)
@@ -88,10 +97,10 @@ class DeepResearchAgent:
         except Exception:  # pragma: no cover - best effort only
             pass
 
-    def _init_llm(self) -> HelloAgentsLLM:
+    def _init_llm(self, model_override: str | None = None) -> HelloAgentsLLM:
         llm_kwargs: dict[str, Any] = {"temperature": 0.0}
 
-        model_id = self.config.llm_model_id or self.config.local_llm
+        model_id = model_override or self.config.llm_model_id or self.config.local_llm
         if model_id:
             llm_kwargs["model"] = model_id
 
@@ -114,10 +123,17 @@ class DeepResearchAgent:
 
         return HelloAgentsLLM(**llm_kwargs)
 
-    def _create_tool_aware_agent(self, *, name: str, system_prompt: str) -> ToolAwareSimpleAgent:
+    def _create_tool_aware_agent(
+        self,
+        *,
+        name: str,
+        system_prompt: str,
+        model_override: str | None = None,
+    ) -> ToolAwareSimpleAgent:
+        llm = self.llm if not model_override else self._init_llm(model_override=model_override)
         return ToolAwareSimpleAgent(
             name=name,
-            llm=self.llm,
+            llm=llm,
             system_prompt=system_prompt,
             enable_tool_calling=self.tools_registry is not None,
             tool_registry=self.tools_registry,
@@ -133,21 +149,58 @@ class DeepResearchAgent:
     ) -> SummaryStateOutput:
         state = self._bootstrap_state(topic, run_id=run_id, trace_id=trace_id)
 
+        planning_started = perf_counter()
         self._ensure_tasks(state)
-        for task in self._ordered_ready_tasks(state.todo_items):
-            if task.status in {"completed", "skipped", "failed"}:
-                continue
-            for _ in self._execute_task_with_retry(state, task, emit_stream=False, step=None):
-                pass
-            self._snapshot_state(state)
+        self._record_stage_duration(state, "planning", planning_started)
 
+        while True:
+            remaining = [
+                task for task in state.todo_items if task.status in {"pending", "in_progress", "retrying"}
+            ]
+            if not remaining:
+                break
+
+            completed_ids = {task.id for task in state.todo_items if task.status == "completed"}
+            ready = [
+                task
+                for task in remaining
+                if all(dep in completed_ids for dep in task.depends_on)
+            ]
+
+            if not ready:
+                for task in remaining:
+                    task.status = "skipped"
+                    task.last_error = "依赖未满足或存在循环依赖"
+                    self._persist_task_artifact(state, task)
+                break
+
+            ready.sort(key=lambda item: (-item.priority, item.id))
+            batch = ready[: max(1, int(state.task_concurrency or 1))]
+            for _ in self._execute_task_batch(state, batch, emit_stream=False, step_map={}):
+                pass
+
+            for task in batch:
+                self._persist_task_artifact(state, task)
+
+            snapshot_started = perf_counter()
+            self._snapshot_state(state)
+            self._record_stage_duration(state, "persist", snapshot_started)
+
+        report_started = perf_counter()
         report = self.reporting.generate_report(state)
+        self._record_stage_duration(state, "reporting", report_started)
         self._sync_tool_events(state, emit_stream=False, step=None)
         state.structured_report = report
         state.running_summary = report
+        self._persist_final_report_artifact(state, report)
         self._persist_final_report(state, report)
         state.completed = True
+        self._archive_run_note_files(state)
+        self._persist_manifest(state)
+
+        final_snapshot_started = perf_counter()
         self._snapshot_state(state, completed=True)
+        self._record_stage_duration(state, "persist", final_snapshot_started)
 
         return SummaryStateOutput(
             running_summary=report,
@@ -187,9 +240,22 @@ class DeepResearchAgent:
             payload={"message": "初始化研究流程"},
             step=0,
         )
+        yield self._emit_event(
+            state,
+            event_type="runtime_options",
+            payload={
+                "mode": state.runtime_mode,
+                "max_sources": state.max_sources,
+                "concurrency": state.task_concurrency,
+                "model_profile": self._model_profile,
+            },
+            step=0,
+        )
 
         tasks_preexisting = bool(state.todo_items)
+        planning_started = perf_counter()
         self._ensure_tasks(state)
+        self._record_stage_duration(state, "planning", planning_started)
         if not tasks_preexisting:
             yield self._emit_event(
                 state,
@@ -222,6 +288,7 @@ class DeepResearchAgent:
                 for task in remaining:
                     task.status = "skipped"
                     task.last_error = "依赖未满足或存在循环依赖"
+                    self._persist_task_artifact(state, task)
                     yield self._emit_event(
                         state,
                         event_type="task_status",
@@ -232,32 +299,47 @@ class DeepResearchAgent:
                 break
 
             ready.sort(key=lambda item: (-item.priority, item.id))
-            task = ready[0]
-            step = step_map.get(task.id)
+            batch = ready[: max(1, int(state.task_concurrency or 1))]
 
-            yield self._emit_event(
-                state,
-                event_type="task_status",
-                payload=self._task_status_payload(task, status="in_progress"),
-                task_id=task.id,
-                step=step,
-            )
+            for task in batch:
+                step = step_map.get(task.id)
+                yield self._emit_event(
+                    state,
+                    event_type="task_status",
+                    payload=self._task_status_payload(task, status="in_progress"),
+                    task_id=task.id,
+                    step=step,
+                )
 
-            for event in self._execute_task_with_retry(state, task, emit_stream=True, step=step):
+            for event in self._execute_task_batch(state, batch, emit_stream=True, step_map=step_map):
                 yield event
 
-            if task.status == "completed":
-                completed_ids.add(task.id)
+            for task in batch:
+                if task.status == "completed":
+                    completed_ids.add(task.id)
+                self._persist_task_artifact(state, task)
 
+            snapshot_started = perf_counter()
             self._snapshot_state(state)
+            self._record_stage_duration(state, "persist", snapshot_started)
 
+        report_started = perf_counter()
         report = self.reporting.generate_report(state)
+        self._record_stage_duration(state, "reporting", report_started)
         for event in self._sync_tool_events(state, emit_stream=True, step=len(state.todo_items) + 1):
             yield event
 
         state.structured_report = report
         state.running_summary = report
+        self._persist_final_report_artifact(state, report)
         note_event = self._persist_final_report(state, report)
+        state.completed = True
+        self._archive_run_note_files(state)
+
+        if note_event and state.report_note_path:
+            note_event["note_path"] = state.report_note_path
+
+        self._persist_manifest(state)
         if note_event:
             yield self._emit_event(
                 state,
@@ -273,12 +355,20 @@ class DeepResearchAgent:
                 "report": report,
                 "note_id": state.report_note_id,
                 "note_path": state.report_note_path,
+                "artifact_paths": list(state.artifact_paths),
+                "stage_durations": dict(state.stage_durations),
+                "runtime_config": {
+                    "mode": state.runtime_mode,
+                    "max_sources": state.max_sources,
+                    "concurrency": state.task_concurrency,
+                },
             },
             step=len(state.todo_items) + 1,
         )
 
-        state.completed = True
+        final_snapshot_started = perf_counter()
         self._snapshot_state(state, completed=True)
+        self._record_stage_duration(state, "persist", final_snapshot_started)
         yield self._emit_event(state, event_type="done", payload={"ok": True}, step=len(state.todo_items) + 1)
 
     def _ensure_tasks(self, state: SummaryState) -> None:
@@ -320,6 +410,91 @@ class DeepResearchAgent:
             ordered.extend(unresolved)
 
         return ordered
+
+    def _execute_task_batch(
+        self,
+        state: SummaryState,
+        tasks: list[TodoItem],
+        *,
+        emit_stream: bool,
+        step_map: dict[int, int],
+    ) -> Iterator[dict[str, Any]]:
+        if not tasks:
+            return
+
+        if len(tasks) <= 1 or int(state.task_concurrency or 1) <= 1:
+            for task in tasks:
+                step = step_map.get(task.id)
+                for event in self._execute_task_with_retry(state, task, emit_stream=emit_stream, step=step):
+                    yield event
+            return
+
+        # 并发模式下保持协议稳定：执行并行，事件按任务完成后补发。
+        max_workers = min(max(1, int(state.task_concurrency or 1)), len(tasks))
+        futures = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for task in tasks:
+                futures[pool.submit(self._run_task_without_stream_events, state, task)] = task
+
+            for future in as_completed(futures):
+                task = futures[future]
+                step = step_map.get(task.id)
+                try:
+                    future.result()
+                except Exception as exc:  # pragma: no cover - defensive
+                    task.status = "failed"
+                    task.last_error = str(exc)
+
+                if emit_stream:
+                    detail = task.last_error if task.status == "failed" else None
+                    if task.sources_summary:
+                        yield self._emit_event(
+                            state,
+                            event_type="sources",
+                            payload={
+                                "latest_sources": task.sources_summary,
+                                "sources_summary": task.sources_summary,
+                                "note_id": task.note_id,
+                                "note_path": task.note_path,
+                            },
+                            task_id=task.id,
+                            step=step,
+                        )
+                    if task.summary:
+                        yield self._emit_event(
+                            state,
+                            event_type="task_summary_chunk",
+                            payload={
+                                "content": task.summary,
+                                "note_id": task.note_id,
+                            },
+                            task_id=task.id,
+                            step=step,
+                        )
+                    for tool_event in self._sync_tool_events(state, emit_stream=True, step=step):
+                        yield tool_event
+                    yield self._emit_event(
+                        state,
+                        event_type="task_status",
+                        payload=self._task_status_payload(
+                            task,
+                            status=task.status,
+                            detail=detail,
+                            summary=task.summary,
+                            sources_summary=task.sources_summary,
+                        ),
+                        task_id=task.id,
+                        step=step,
+                    )
+
+    def _run_task_without_stream_events(self, state: SummaryState, task: TodoItem) -> None:
+        for _ in self._execute_task_with_retry(state, task, emit_stream=False, step=None):
+            pass
+
+    @staticmethod
+    def _record_stage_duration(state: SummaryState, stage: str, started: float) -> None:
+        elapsed = max(0.0, perf_counter() - started)
+        state.stage_durations[stage] = round(float(state.stage_durations.get(stage, 0.0)) + elapsed, 3)
 
     def _execute_task_with_retry(
         self,
@@ -378,11 +553,13 @@ class DeepResearchAgent:
     ) -> Iterator[dict[str, Any]]:
         task.status = "in_progress"
 
+        search_started = perf_counter()
         search_bundle, backend = dispatch_search(
             task.query,
             self.config,
             state.research_loop_count,
         )
+        self._record_stage_duration(state, "search", search_started)
         task.notices = search_bundle.notices
 
         for event in self._sync_tool_events(state, emit_stream=emit_stream, step=step):
@@ -420,6 +597,7 @@ class DeepResearchAgent:
             state.research_loop_count += 1
 
         if emit_stream:
+            summary_started = perf_counter()
             yield self._emit_event(
                 state,
                 event_type="sources",
@@ -453,8 +631,11 @@ class DeepResearchAgent:
                         yield event
             finally:
                 summary_text = summary_getter()
+                self._record_stage_duration(state, "summarization", summary_started)
         else:
+            summary_started = perf_counter()
             summary_text = self.summarizer.summarize_task(state, task, context)
+            self._record_stage_duration(state, "summarization", summary_started)
             self._sync_tool_events(state, emit_stream=False, step=step)
 
         task.summary = summary_text.strip() if summary_text else "暂无可用信息"
@@ -585,6 +766,16 @@ class DeepResearchAgent:
             topic=topic,
         )
 
+        friendly_name = str(run_doc.get("friendly_name") or "").strip()
+        created_at = str(run_doc.get("created_at") or "").strip()
+
+        artifact_root = self._ensure_run_artifact_root(
+            resolved_run_id,
+            topic=topic,
+            friendly_name=friendly_name,
+            created_at=created_at,
+        )
+
         state_payload = run_doc.get("state")
         if isinstance(state_payload, dict) and state_payload:
             restored = self._restore_state_from_payload(
@@ -593,6 +784,9 @@ class DeepResearchAgent:
                 run_id=resolved_run_id,
                 trace_id=resolved_trace_id,
                 persisted_sequence=int(run_doc.get("sequence") or 0),
+                created_at=str(run_doc.get("created_at") or ""),
+                updated_at=str(run_doc.get("updated_at") or ""),
+                artifact_root=artifact_root,
             )
             return restored
 
@@ -600,7 +794,13 @@ class DeepResearchAgent:
             research_topic=topic,
             run_id=resolved_run_id,
             trace_id=resolved_trace_id,
+            created_at=str(run_doc.get("created_at") or self._utc_now()),
+            updated_at=str(run_doc.get("updated_at") or self._utc_now()),
             next_sequence=max(1, int(run_doc.get("sequence") or 0) + 1),
+            artifact_root=artifact_root,
+            runtime_mode=self.config.normalized_runtime_mode(),
+            max_sources=self.config.resolved_max_sources(),
+            task_concurrency=self.config.resolved_task_concurrency(),
         )
 
     def _restore_state_from_payload(
@@ -611,6 +811,9 @@ class DeepResearchAgent:
         run_id: str,
         trace_id: str,
         persisted_sequence: int,
+        created_at: str,
+        updated_at: str,
+        artifact_root: str,
     ) -> SummaryState:
         todos_raw = payload.get("todo_items") if isinstance(payload.get("todo_items"), list) else []
         todo_items: list[TodoItem] = []
@@ -626,6 +829,8 @@ class DeepResearchAgent:
             research_topic=str(payload.get("research_topic") or topic),
             run_id=run_id,
             trace_id=trace_id,
+            created_at=created_at or str(payload.get("created_at") or self._utc_now()),
+            updated_at=updated_at or str(payload.get("updated_at") or self._utc_now()),
             next_sequence=max(int(payload.get("next_sequence") or 1), persisted_sequence + 1),
             web_research_results=list(payload.get("web_research_results") or []),
             sources_gathered=list(payload.get("sources_gathered") or []),
@@ -635,14 +840,25 @@ class DeepResearchAgent:
             structured_report=payload.get("structured_report"),
             report_note_id=payload.get("report_note_id"),
             report_note_path=payload.get("report_note_path"),
+            artifact_root=str(payload.get("artifact_root") or artifact_root or ""),
+            artifact_paths=list(payload.get("artifact_paths") or []),
+            runtime_mode=str(payload.get("runtime_mode") or self.config.normalized_runtime_mode()),
+            max_sources=int(payload.get("max_sources") or self.config.resolved_max_sources()),
+            task_concurrency=int(payload.get("task_concurrency") or self.config.resolved_task_concurrency()),
+            stage_durations=dict(payload.get("stage_durations") or {}),
             completed=bool(payload.get("completed") or False),
         )
 
     def _snapshot_state(self, state: SummaryState, *, completed: bool | None = None) -> None:
+        if not state.created_at:
+            state.created_at = self._utc_now()
+        state.updated_at = self._utc_now()
         payload = {
             "research_topic": state.research_topic,
             "run_id": state.run_id,
             "trace_id": state.trace_id,
+            "created_at": state.created_at,
+            "updated_at": state.updated_at,
             "next_sequence": state.next_sequence,
             "web_research_results": list(state.web_research_results),
             "sources_gathered": list(state.sources_gathered),
@@ -652,6 +868,12 @@ class DeepResearchAgent:
             "structured_report": state.structured_report,
             "report_note_id": state.report_note_id,
             "report_note_path": state.report_note_path,
+            "artifact_root": state.artifact_root,
+            "artifact_paths": list(state.artifact_paths),
+            "runtime_mode": state.runtime_mode,
+            "max_sources": state.max_sources,
+            "task_concurrency": state.task_concurrency,
+            "stage_durations": dict(state.stage_durations),
             "completed": state.completed if completed is None else completed,
         }
         self.run_store.save_state(state.run_id, payload, completed=completed)
@@ -678,6 +900,200 @@ class DeepResearchAgent:
             "note_path": task.note_path,
             "stream_token": task.stream_token,
         }
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _ensure_run_artifact_root(
+        self,
+        run_id: str,
+        *,
+        topic: str = "",
+        friendly_name: str = "",
+        created_at: str = "",
+    ) -> str:
+        base = Path(self.config.notes_workspace or "./notes")
+        runs_root = base / "runs"
+        runs_root.mkdir(parents=True, exist_ok=True)
+
+        folder_name = friendly_name.strip()
+        if not folder_name:
+            prefix = (created_at[:19] if created_at else self._utc_now()[:19]).replace("-", "").replace(":", "").replace("T", "-")
+            topic_slug = self._safe_filename(topic, fallback="research", max_length=40)
+            folder_name = f"{prefix}-{topic_slug}-{run_id[:8]}"
+
+        safe_folder = self._safe_filename(folder_name, fallback=run_id, max_length=96)
+        root = runs_root / safe_folder
+        root.mkdir(parents=True, exist_ok=True)
+        return str(root)
+
+    @staticmethod
+    def _safe_filename(value: str, *, fallback: str, max_length: int = 64) -> str:
+        cleaned = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", (value or "").strip())
+        cleaned = cleaned.strip("_")
+        if not cleaned:
+            cleaned = fallback
+        return cleaned[:max_length]
+
+    def _register_artifact_path(self, state: SummaryState, path: Path) -> None:
+        as_text = str(path)
+        if as_text not in state.artifact_paths:
+            state.artifact_paths.append(as_text)
+
+    def _persist_task_artifact(self, state: SummaryState, task: TodoItem) -> None:
+        if not state.artifact_root:
+            return
+
+        root = Path(state.artifact_root)
+        root.mkdir(parents=True, exist_ok=True)
+        file_name = self._safe_filename(task.title, fallback=f"task_{task.id}")
+        file_path = root / f"task_{task.id:02d}_{file_name}.md"
+
+        content = [
+            f"# 任务 {task.id}: {task.title}",
+            "",
+            f"- 任务目标: {task.intent}",
+            f"- 检索查询: {task.query}",
+            f"- 状态: {task.status}",
+            f"- 尝试次数: {task.attempt_count}",
+            f"- 更新时间: {self._utc_now()}",
+            "",
+            "## 来源摘要",
+            task.sources_summary or "暂无来源",
+            "",
+            "## 任务总结",
+            task.summary or "暂无可用信息",
+            "",
+        ]
+
+        if task.notices:
+            content.extend(["## 系统提示", *[f"- {notice}" for notice in task.notices], ""])
+
+        if task.last_error:
+            content.extend(["## 失败原因", task.last_error, ""])
+
+        file_path.write_text("\n".join(content), encoding="utf-8")
+        self._register_artifact_path(state, file_path)
+
+    def _persist_final_report_artifact(self, state: SummaryState, report: str) -> None:
+        if not state.artifact_root:
+            return
+        root = Path(state.artifact_root)
+        root.mkdir(parents=True, exist_ok=True)
+
+        file_path = root / "final_report.md"
+        file_path.write_text(report or "", encoding="utf-8")
+        self._register_artifact_path(state, file_path)
+
+    def _persist_manifest(self, state: SummaryState) -> None:
+        if not state.artifact_root:
+            return
+        root = Path(state.artifact_root)
+        root.mkdir(parents=True, exist_ok=True)
+
+        completed_count = len([t for t in state.todo_items if t.status == "completed"])
+        manifest = {
+            "run_id": state.run_id,
+            "trace_id": state.trace_id,
+            "topic": state.research_topic,
+            "created_at": state.created_at,
+            "updated_at": state.updated_at or self._utc_now(),
+            "completed": bool(state.completed),
+            "runtime": {
+                "mode": state.runtime_mode,
+                "max_sources": state.max_sources,
+                "concurrency": state.task_concurrency,
+                "model_profile": self._model_profile,
+            },
+            "progress": {
+                "total_tasks": len(state.todo_items),
+                "completed_tasks": completed_count,
+            },
+            "stage_durations": dict(state.stage_durations),
+            "artifact_paths": list(state.artifact_paths),
+        }
+
+        file_path = root / "manifest.json"
+        file_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._register_artifact_path(state, file_path)
+
+    def _archive_run_note_files(self, state: SummaryState) -> None:
+        if not state.completed or not state.artifact_root:
+            return
+
+        workspace = Path(self.config.notes_workspace or "./notes")
+        root = Path(state.artifact_root)
+        archive_dir = root / "notes"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        note_ids_to_remove: set[str] = set()
+
+        for task in state.todo_items:
+            if task.note_id:
+                note_ids_to_remove.add(task.note_id)
+            if not task.note_path:
+                continue
+
+            original = Path(task.note_path)
+            if not original.exists() or original.parent != workspace:
+                continue
+
+            target = archive_dir / original.name
+            try:
+                shutil.move(str(original), str(target))
+                task.note_path = str(target)
+                self._register_artifact_path(state, target)
+            except Exception:
+                logger.warning("Failed to archive task note: %s", original)
+
+        if state.report_note_id:
+            note_ids_to_remove.add(state.report_note_id)
+        if state.report_note_path:
+            original = Path(state.report_note_path)
+            if original.exists() and original.parent == workspace:
+                target = archive_dir / original.name
+                try:
+                    shutil.move(str(original), str(target))
+                    state.report_note_path = str(target)
+                    self._register_artifact_path(state, target)
+                except Exception:
+                    logger.warning("Failed to archive report note: %s", original)
+
+        if note_ids_to_remove:
+            self._remove_note_index_entries(workspace, note_ids_to_remove)
+
+    @staticmethod
+    def _remove_note_index_entries(workspace: Path, note_ids: set[str]) -> None:
+        index_path = workspace / "notes_index.json"
+        if not index_path.exists() or not note_ids:
+            return
+
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        notes = payload.get("notes") if isinstance(payload, dict) else None
+        if not isinstance(notes, list):
+            return
+
+        filtered = [item for item in notes if isinstance(item, dict) and str(item.get("id") or "") not in note_ids]
+        if len(filtered) == len(notes):
+            return
+
+        payload["notes"] = filtered
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        metadata["total_notes"] = len(filtered)
+        payload["metadata"] = metadata
+
+        try:
+            index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            return
 
     def _persist_final_report(self, state: SummaryState, report: str) -> dict[str, Any] | None:
         if not self.note_tool or not report or not report.strip():

@@ -56,7 +56,7 @@ def dispatch_search(
                 "backend": search_api,
                 "mode": "structured",
                 "fetch_full_page": config.fetch_full_page,
-                "max_results": 5,
+                "max_results": config.resolved_max_sources(),
                 "max_tokens_per_source": MAX_TOKENS_PER_SOURCE,
                 "loop_count": loop_count,
             }
